@@ -1,0 +1,279 @@
+#region Help:  Introduction to the script task
+/* The Script Task allows you to perform virtually any operation that can be accomplished in
+ * a .Net application within the context of an Integration Services control flow. */
+#endregion
+
+#region Namespaces
+using System;
+using System.Data;
+using System.Diagnostics;
+using System.IO;
+using System.Windows.Forms;
+using Microsoft.SqlServer.Dts.Runtime;
+#endregion
+
+namespace ST_4eb172726b8747ecba8e569dce30f110
+{
+    [Microsoft.SqlServer.Dts.Tasks.ScriptTask.SSISScriptTaskEntryPointAttribute]
+    public partial class ScriptMain : Microsoft.SqlServer.Dts.Tasks.ScriptTask.VSTARTScriptObjectModelBase
+    {
+        private const string PythonExe = @"C:\Program Files\Python310\python.exe";
+        private const string WorkingDir = @"C:\SSIS_Packages";
+        private const int TimeoutMs = 300000; // 5 minutes per script
+
+        // ── The three scripts to run in order ────────────────────────────────
+        private static readonly string[][] Scripts = new string[][]
+        {
+            new string[] {
+                @"C:\SSIS_Packages\erp_automation_mtd.py",
+                @"C:\SSIS_Packages\Sales_Invoices_MTD_Automation.txt",
+                "Sales Invoices MTD"
+
+            }, 
+
+                new string[] {
+                @"C:\SSIS_Packages\Debtors_Summary_Report_MTD.py",
+                @"C:\SSIS_Packages\Debtors_Summary_Report_MTD_Automation.txt",
+                "Sales Invoices MTD"
+            },
+
+                new string[] {
+                @"C:\SSIS_Packages\Job_tracking_ARJ.py",
+                @"C:\SSIS_Packages\Job_tracking_ARJ_Automation.txt",
+                "Job tracking ARJ"
+            },
+
+
+                new string[] {
+                @"C:\SSIS_Packages\Job_tracking_FAFA.py",
+                @"C:\SSIS_Packages\Job_tracking_FAFA_Automation.txt",
+                "Job tracking FAFA"
+            },
+
+                new string[] {
+                @"C:\SSIS_Packages\Job_tracking_NCPI.py",
+                @"C:\SSIS_Packages\Job_tracking_NCPI_Automation.txt",
+                "Job tracking NCPI"
+            },
+
+                new string[] {
+                @"C:\SSIS_Packages\Job_tracking_ARK.py",
+                @"C:\SSIS_Packages\Job_tracking_ARK_Automation.txt",
+                "Job tracking ARK"
+            },
+
+                 new string[] {
+                @"C:\SSIS_Packages\Job_tracking_SVB.py",
+                @"C:\SSIS_Packages\Job_tracking_SVB_Automation.txt",
+                "Job tracking ARK"
+            },
+
+                new string[] {
+                @"C:\SSIS_Packages\cutomer_sales_mtd.py",
+                @"C:\SSIS_Packages\Customer_Sales_MTD_Automation.txt",
+                "Customer Sales MTD"
+
+
+            },
+
+
+
+                new string[] {
+                @"C:\SSIS_Packages\Job_order_status.py",
+                @"C:\SSIS_Packages\Job_Order_Status_Automation.txt",
+                "Job Order Status"
+
+
+            },
+
+       
+            new string[] {
+                @"C:\SSIS_Packages\collected_aging_mtd.py",                    // ← عدّل
+                @"C:\SSIS_Packages\Debtors_Ageing_MTD_Automation.txt",
+                "Collected Ageing MTD"
+            },
+        };
+
+        public void Main()
+        {
+            bool fireAgain = true;
+
+            try
+            {
+                // ── Validate Python & working dir once ────────────────────────
+                if (!File.Exists(PythonExe))
+                {
+                    Dts.Events.FireError(1, "ERP Automation",
+                        "Python not found: " + PythonExe, "", 0);
+                    Dts.TaskResult = (int)ScriptResults.Failure;
+                    return;
+                }
+
+                if (!Directory.Exists(WorkingDir))
+                {
+                    Dts.Events.FireError(2, "ERP Automation",
+                        "Working directory not found: " + WorkingDir, "", 0);
+                    Dts.TaskResult = (int)ScriptResults.Failure;
+                    return;
+                }
+
+                // ── Run each script in sequence ───────────────────────────────
+                foreach (string[] script in Scripts)
+                {
+                    string scriptPath = script[0];
+                    string logFile = script[1];
+                    string label = script[2];
+
+                    bool ok = RunScript(scriptPath, logFile, label, fireAgain);
+
+                    if (!ok)
+                    {
+                        Dts.Events.FireError(99, "ERP Automation",
+                            label + " FAILED. Stopping pipeline.", "", 0);
+                        Dts.TaskResult = (int)ScriptResults.Failure;
+                        return;
+                    }
+
+                    Dts.Events.FireInformation(0, "ERP Automation",
+                        label + " completed successfully. Moving to next...",
+                        "", 0, ref fireAgain);
+                }
+
+                Dts.Events.FireInformation(0, "ERP Automation",
+                    "ALL 3 scripts completed successfully.", "", 0, ref fireAgain);
+                Dts.TaskResult = (int)ScriptResults.Success;
+            }
+            catch (Exception ex)
+            {
+                Dts.Events.FireError(99, "ERP Automation",
+                    "Unexpected exception: " + ex.Message, "", 0);
+                Dts.TaskResult = (int)ScriptResults.Failure;
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────────────────
+        // Runs a single Python script and returns true = success, false = failed
+        // ─────────────────────────────────────────────────────────────────────
+        private bool RunScript(string scriptPath, string logFile,
+                               string label, bool fireAgain)
+        {
+            string stdOut = string.Empty;
+            string stdErr = string.Empty;
+            int exitCode = -1;
+
+            try
+            {
+                // Validate script file exists
+                if (!File.Exists(scriptPath))
+                {
+                    Dts.Events.FireError(2, label,
+                        "Script not found: " + scriptPath, "", 0);
+                    return false;
+                }
+
+                // Delete old log before run
+                if (File.Exists(logFile))
+                    File.Delete(logFile);
+
+                Dts.Events.FireInformation(0, label,
+                    "Starting: " + scriptPath, "", 0, ref fireAgain);
+
+                // Launch Python
+                ProcessStartInfo psi = new ProcessStartInfo();
+                psi.FileName = PythonExe;
+                psi.Arguments = "\"" + scriptPath + "\"";
+                psi.RedirectStandardOutput = true;
+                psi.RedirectStandardError = true;
+                psi.UseShellExecute = false;
+                psi.CreateNoWindow = true;
+                psi.WorkingDirectory = WorkingDir;
+                psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8";
+                psi.EnvironmentVariables["PYTHONUNBUFFERED"] = "1";
+
+                using (Process process = new Process())
+                {
+                    process.StartInfo = psi;
+                    process.Start();
+
+                    stdOut = process.StandardOutput.ReadToEnd();
+                    stdErr = process.StandardError.ReadToEnd();
+
+                    bool finished = process.WaitForExit(TimeoutMs);
+                    if (!finished)
+                    {
+                        process.Kill();
+                        throw new Exception(label + " timed out after "
+                            + (TimeoutMs / 1000) + "s.");
+                    }
+                    exitCode = process.ExitCode;
+                }
+
+                // Log stdout / stderr
+                if (!string.IsNullOrWhiteSpace(stdOut))
+                    Dts.Events.FireInformation(4, label + " stdout",
+                        stdOut, "", 0, ref fireAgain);
+
+                if (!string.IsNullOrWhiteSpace(stdErr))
+                    Dts.Events.FireWarning(5, label + " stderr", stdErr, "", 0);
+
+                // Read log file written by Python
+                string logContent = ReadLogFile(logFile);
+                Dts.Events.FireInformation(6, label + " log",
+                    "ExitCode=" + exitCode + " | Log=" + logContent,
+                    "", 0, ref fireAgain);
+
+                // Check log content first (most reliable)
+                if (logContent.Contains("SUCCESS"))
+                    return true;
+
+                if (logContent.Contains("FAILED"))
+                {
+                    Dts.Events.FireError(8, label,
+                        "Script reported FAILED. Log: " + logContent, "", 0);
+                    return false;
+                }
+
+                // Fall back to exit code
+                if (exitCode != 0)
+                {
+                    Dts.Events.FireError(7, label,
+                        "Exit code: " + exitCode + " | stdout: "
+                        + stdOut.Substring(0, Math.Min(stdOut.Length, 1000)),
+                        "", 0);
+                    return false;
+                }
+
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Dts.Events.FireError(99, label,
+                    "Exception: " + ex.Message, "", 0);
+                return false;
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────────────────
+        private static string ReadLogFile(string path)
+        {
+            try
+            {
+                if (File.Exists(path))
+                    return File.ReadAllText(path).Trim();
+                return "(log file not found)";
+            }
+            catch (Exception ex)
+            {
+                return "(log read error: " + ex.Message + ")";
+            }
+        }
+
+        #region ScriptResults declaration
+        enum ScriptResults
+        {
+            Success = Microsoft.SqlServer.Dts.Runtime.DTSExecResult.Success,
+            Failure = Microsoft.SqlServer.Dts.Runtime.DTSExecResult.Failure
+        };
+        #endregion
+    }
+}

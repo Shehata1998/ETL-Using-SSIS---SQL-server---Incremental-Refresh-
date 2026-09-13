@@ -1,0 +1,529 @@
+/* ==========================================================================
+   ALL-IN-ONE ETL DEPLOY — Sales_Data + Collection_Data + Dues_Actual_Collection
+   Safe to re-run in full any time (everything is DROP-IF-EXISTS / CREATE).
+
+   SHARED (Section 0): fn_ParseFlexDate, fn_SafeParseDateTime, ETL_Watermark
+     - all created once in SM_DB_WH, used by more than one pipeline below.
+
+   PIPELINE 1 (Section 1) — incremental MERGE, full-table scan each run:
+     SM_DB.dbo.Sales_Invoices_Staging -> SM_DB_WH.dbo.Sales_Data
+     match key: UNIT_REF + INV_NUMBER + ICODE + MORDER
+
+   PIPELINE 2 (Section 2) — incremental MERGE, full-table scan each run;
+     also creates the staging table (didn't exist yet):
+     SM_DB.dbo.Collected_Aging_MTD_Staging -> SM_DB_WH.dbo.Collection_Data
+     match key: VEND_CODE + INV_NO
+
+   PIPELINE 3 (Section 3) — full DELETE + INSERT (no match key, no
+     incremental tracking — a clean snapshot every run):
+     SM_DB.dbo.Debtor_Aging_Staging -> SM_DB_WH.dbo.Dues_Actual_Collection
+     ASSUMPTION: staging column names mirror the target's (raw text) —
+     flag it if the real staging columns differ.
+
+   All three pipelines are independent: each has its own procedure and
+   SQL Agent job, and a failure in one never blocks or rolls back another.
+
+   Design notes carried over from troubleshooting Sales_Data:
+     - Source staging tables here are truncated/reloaded by SSIS rather
+       than accumulating history, so pipelines 1-2 deliberately scan the
+       ENTIRE staging table every run (no date-window filter) instead of
+       a watermark+lookback approach, which was found to silently skip
+       older rows still sitting in a reloaded staging table.
+     - TRY_CONVERT alone does not reliably suppress "out of range" errors
+       when converting text to DATETIME (valid range starts 1753) or when
+       DATEFROMPARTS gets an impossible date (e.g. Feb 30). Both
+       fn_ParseFlexDate and fn_SafeParseDateTime validate components with
+       plain string/number checks BEFORE calling any conversion function.
+   ========================================================================== */
+
+
+/* ==========================================================================
+   SECTION 0 — SHARED OBJECTS
+   ========================================================================== */
+
+SET NOCOUNT ON;
+USE SM_DB_WH;
+GO
+
+-- 0.1) Locale-safe DATE parser (yyyy-MM-dd or yyyy-Mon-dd)
+IF OBJECT_ID('dbo.fn_ParseFlexDate') IS NOT NULL
+    DROP FUNCTION dbo.fn_ParseFlexDate;
+GO
+
+CREATE FUNCTION dbo.fn_ParseFlexDate (@d NVARCHAR(50))
+RETURNS DATE
+AS
+BEGIN
+    DECLARE @Result DATE = NULL;
+
+    SET @Result = TRY_CONVERT(DATE, @d, 23);
+
+    IF @Result IS NULL AND @d LIKE '[0-9][0-9][0-9][0-9]-[A-Za-z][A-Za-z][A-Za-z]-[0-9][0-9]'
+    BEGIN
+        DECLARE @Yr INT = TRY_CONVERT(INT, LEFT(@d,4));
+        DECLARE @Dy INT = TRY_CONVERT(INT, RIGHT(@d,2));
+        DECLARE @MonNum INT = CASE UPPER(SUBSTRING(@d, 6, 3))
+            WHEN 'JAN' THEN 1  WHEN 'FEB' THEN 2  WHEN 'MAR' THEN 3  WHEN 'APR' THEN 4
+            WHEN 'MAY' THEN 5  WHEN 'JUN' THEN 6  WHEN 'JUL' THEN 7  WHEN 'AUG' THEN 8
+            WHEN 'SEP' THEN 9  WHEN 'OCT' THEN 10 WHEN 'NOV' THEN 11 WHEN 'DEC' THEN 12
+            ELSE NULL
+        END;
+
+        IF @Yr BETWEEN 1 AND 9999
+           AND @MonNum IS NOT NULL
+           AND @Dy BETWEEN 1 AND 31
+           AND @Dy <= DATEPART(DAY, EOMONTH(DATEFROMPARTS(@Yr, @MonNum, 1)))
+            SET @Result = DATEFROMPARTS(@Yr, @MonNum, @Dy);
+    END
+
+    RETURN @Result;
+END
+GO
+
+-- 0.2) Safe DATETIME parser (ISO or dd/MM/yyyy HH:MM:SS)
+IF OBJECT_ID('dbo.fn_SafeParseDateTime') IS NOT NULL
+    DROP FUNCTION dbo.fn_SafeParseDateTime;
+GO
+
+CREATE FUNCTION dbo.fn_SafeParseDateTime (@d NVARCHAR(50))
+RETURNS DATETIME
+AS
+BEGIN
+    DECLARE @Result DATETIME = NULL;
+    DECLARE @Yr INT;
+
+    IF @d LIKE '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]%'
+    BEGIN
+        SET @Yr = TRY_CONVERT(INT, LEFT(@d, 4));
+        IF @Yr BETWEEN 1753 AND 9999
+            SET @Result = TRY_CONVERT(DATETIME, @d, 120);
+    END
+
+    IF @Result IS NULL AND @d LIKE '[0-9][0-9]/[0-9][0-9]/[0-9][0-9][0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]%'
+    BEGIN
+        SET @Yr = TRY_CONVERT(INT, SUBSTRING(@d, 7, 4));
+        IF @Yr BETWEEN 1753 AND 9999
+            SET @Result = TRY_CONVERT(DATETIME,
+                SUBSTRING(@d, 7, 4) + '-' + SUBSTRING(@d, 4, 2) + '-' + SUBSTRING(@d, 1, 2)
+                + ' ' + SUBSTRING(@d, 12, 8), 120);
+    END
+
+    RETURN @Result;
+END
+GO
+
+-- 0.3) Shared watermark/run-log table (logging only for pipelines 1-3)
+IF NOT EXISTS (SELECT 1 FROM sys.tables WHERE name = 'ETL_Watermark')
+BEGIN
+    CREATE TABLE dbo.ETL_Watermark (
+        TableName     VARCHAR(100) PRIMARY KEY,
+        LastLoadDate  DATE NOT NULL,
+        LastRunLog    NVARCHAR(4000) NULL,
+        LastRunTime   DATETIME NULL
+    );
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM dbo.ETL_Watermark WHERE TableName = 'Sales_Data')
+    INSERT INTO dbo.ETL_Watermark (TableName, LastLoadDate) VALUES ('Sales_Data', '2000-01-01');
+IF NOT EXISTS (SELECT 1 FROM dbo.ETL_Watermark WHERE TableName = 'Collection_Data')
+    INSERT INTO dbo.ETL_Watermark (TableName, LastLoadDate) VALUES ('Collection_Data', '2000-01-01');
+IF NOT EXISTS (SELECT 1 FROM dbo.ETL_Watermark WHERE TableName = 'Dues_Actual_Collection')
+    INSERT INTO dbo.ETL_Watermark (TableName, LastLoadDate) VALUES ('Dues_Actual_Collection', '2000-01-01');
+GO
+
+
+/* ==========================================================================
+   SECTION 1 — PIPELINE: Sales_Data
+   ========================================================================== */
+
+IF OBJECT_ID('dbo.usp_Load_Sales_Data_Incremental') IS NOT NULL
+    DROP PROCEDURE dbo.usp_Load_Sales_Data_Incremental;
+GO
+
+CREATE PROCEDURE dbo.usp_Load_Sales_Data_Incremental
+AS
+BEGIN
+    SET NOCOUNT ON;
+    DECLARE @RowsAffected INT;
+
+    BEGIN TRY
+        BEGIN TRANSACTION;
+
+        MERGE dbo.Sales_Data AS Target
+        USING (
+            SELECT
+                UNIT_REF,
+                TRY_CONVERT(FLOAT, INV_TYPE)                                    AS INV_TYPE,
+                INV_NUMBER,
+                CONVERT(NVARCHAR(255), SM_DB_WH.dbo.fn_ParseFlexDate(INV_DATED), 23) AS INV_DATED,
+                CUSTOMER, SALES_REP, SUB_GRP_NAME, ITEM_NAME, PARTCODE,
+                TRY_CONVERT(FLOAT, REPLACE(INV_QUANTITY, ',', ''))             AS INV_QUANTITY,
+                TRY_CONVERT(FLOAT, REPLACE(INV_RATE, ',', ''))                 AS INV_RATE,
+                TRY_CONVERT(FLOAT, REPLACE(INV_AMOUNT, ',', ''))               AS INV_AMOUNT,
+                TRY_CONVERT(FLOAT, REPLACE(TAX_AMOUNT, ',', ''))               AS TAX_AMOUNT,
+                TRY_CONVERT(FLOAT, REPLACE(LINE_TOTAL, ',', ''))               AS LINE_TOTAL,
+                TRY_CONVERT(FLOAT, REPLACE(BILL_TOTAL, ',', ''))               AS BILL_TOTAL,
+                TRY_CONVERT(FLOAT, REPLACE(INV_WT_TONS, ',', ''))              AS INV_WT_TONS,
+                TRY_CONVERT(FLOAT, REPLACE(TOT_PKGS, ',', ''))                 AS TOT_PKGS,
+                FREIGHT,
+                TPT_NAME, TRANSPORT,
+                TRY_CONVERT(FLOAT, VEHICLE_NO)                                  AS VEHICLE_NO,
+                GRNO, GR_DTD, FOC_FILTER, CONSIGNEE, INV_TYPE_NAME,
+                TRY_CONVERT(FLOAT, ORDER_NO)                                    AS ORDER_NO,
+                ORDER_DT, CUST_PO_NO,
+                TRY_CONVERT(FLOAT, DA_NO)                                       AS DA_NO,
+                SM_DB_WH.dbo.fn_SafeParseDateTime(DA_DT)                       AS DA_DT,
+                TRY_CONVERT(FLOAT, DA_INV_TAT)                                  AS DA_INV_TAT,
+                ENT_BY,
+                SM_DB_WH.dbo.fn_SafeParseDateTime(ENT_DT)                      AS ENT_DT,
+                TRY_CONVERT(FLOAT, ICODE)                                       AS ICODE,
+                TRY_CONVERT(FLOAT, MORDER)                                      AS MORDER,
+                TRY_CONVERT(FLOAT, DT_SORT)                                     AS DT_SORT,
+                TRY_CONVERT(FLOAT, VCHNUM)                                      AS VCHNUM,
+                COMP, MODEL, BRAND,
+                TRY_CONVERT(FLOAT, CUST_CODE)                                   AS CUST_CODE
+            FROM SM_DB.dbo.Sales_Invoices_Staging
+        ) AS Source
+        ON  Target.UNIT_REF   = Source.UNIT_REF
+        AND Target.INV_NUMBER = Source.INV_NUMBER
+        AND Target.ICODE      = Source.ICODE
+        AND Target.MORDER     = Source.MORDER
+
+        WHEN MATCHED THEN
+            UPDATE SET
+                INV_TYPE      = Source.INV_TYPE,      INV_DATED     = Source.INV_DATED,
+                CUSTOMER      = Source.CUSTOMER,       SALES_REP     = Source.SALES_REP,
+                SUB_GRP_NAME  = Source.SUB_GRP_NAME,   ITEM_NAME     = Source.ITEM_NAME,
+                PARTCODE      = Source.PARTCODE,       INV_QUANTITY  = Source.INV_QUANTITY,
+                INV_RATE      = Source.INV_RATE,       INV_AMOUNT    = Source.INV_AMOUNT,
+                TAX_AMOUNT    = Source.TAX_AMOUNT,     LINE_TOTAL    = Source.LINE_TOTAL,
+                BILL_TOTAL    = Source.BILL_TOTAL,     INV_WT_TONS   = Source.INV_WT_TONS,
+                TOT_PKGS      = Source.TOT_PKGS,       FREIGHT       = Source.FREIGHT,
+                TPT_NAME      = Source.TPT_NAME,       TRANSPORT     = Source.TRANSPORT,
+                VEHICLE_NO    = Source.VEHICLE_NO,     GRNO          = Source.GRNO,
+                GR_DTD        = Source.GR_DTD,         FOC_FILTER    = Source.FOC_FILTER,
+                CONSIGNEE     = Source.CONSIGNEE,      INV_TYPE_NAME = Source.INV_TYPE_NAME,
+                ORDER_NO      = Source.ORDER_NO,       ORDER_DT      = Source.ORDER_DT,
+                CUST_PO_NO    = Source.CUST_PO_NO,     DA_NO         = Source.DA_NO,
+                DA_DT         = Source.DA_DT,          DA_INV_TAT    = Source.DA_INV_TAT,
+                ENT_BY        = Source.ENT_BY,         ENT_DT        = Source.ENT_DT,
+                DT_SORT       = Source.DT_SORT,        VCHNUM        = Source.VCHNUM,
+                COMP          = Source.COMP,           MODEL         = Source.MODEL,
+                BRAND         = Source.BRAND,          CUST_CODE     = Source.CUST_CODE
+
+        WHEN NOT MATCHED BY TARGET THEN
+            INSERT (
+                UNIT_REF, INV_TYPE, INV_NUMBER, INV_DATED, CUSTOMER, SALES_REP, SUB_GRP_NAME,
+                ITEM_NAME, PARTCODE, INV_QUANTITY, INV_RATE, INV_AMOUNT, TAX_AMOUNT, LINE_TOTAL,
+                BILL_TOTAL, INV_WT_TONS, TOT_PKGS, FREIGHT, TPT_NAME, TRANSPORT, VEHICLE_NO,
+                GRNO, GR_DTD, FOC_FILTER, CONSIGNEE, INV_TYPE_NAME, ORDER_NO, ORDER_DT, CUST_PO_NO,
+                DA_NO, DA_DT, DA_INV_TAT, ENT_BY, ENT_DT, ICODE, MORDER, DT_SORT, VCHNUM, COMP,
+                MODEL, BRAND, CUST_CODE
+            )
+            VALUES (
+                Source.UNIT_REF, Source.INV_TYPE, Source.INV_NUMBER, Source.INV_DATED, Source.CUSTOMER,
+                Source.SALES_REP, Source.SUB_GRP_NAME, Source.ITEM_NAME, Source.PARTCODE, Source.INV_QUANTITY,
+                Source.INV_RATE, Source.INV_AMOUNT, Source.TAX_AMOUNT, Source.LINE_TOTAL, Source.BILL_TOTAL,
+                Source.INV_WT_TONS, Source.TOT_PKGS, Source.FREIGHT, Source.TPT_NAME, Source.TRANSPORT,
+                Source.VEHICLE_NO, Source.GRNO, Source.GR_DTD, Source.FOC_FILTER, Source.CONSIGNEE,
+                Source.INV_TYPE_NAME, Source.ORDER_NO, Source.ORDER_DT, Source.CUST_PO_NO, Source.DA_NO,
+                Source.DA_DT, Source.DA_INV_TAT, Source.ENT_BY, Source.ENT_DT, Source.ICODE, Source.MORDER,
+                Source.DT_SORT, Source.VCHNUM, Source.COMP, Source.MODEL, Source.BRAND, Source.CUST_CODE
+            );
+
+        SET @RowsAffected = @@ROWCOUNT;
+
+        UPDATE dbo.ETL_Watermark
+        SET LastRunLog = CONCAT('OK - ', @RowsAffected, ' rows affected (full sync)'), LastRunTime = GETDATE()
+        WHERE TableName = 'Sales_Data';
+
+        COMMIT TRANSACTION;
+    END TRY
+    BEGIN CATCH
+        IF XACT_STATE() <> 0 ROLLBACK TRANSACTION;
+        UPDATE dbo.ETL_Watermark
+        SET LastRunLog = CONCAT('FAILED - ', ERROR_MESSAGE()), LastRunTime = GETDATE()
+        WHERE TableName = 'Sales_Data';
+        THROW;
+    END CATCH
+END
+GO
+
+
+/* ==========================================================================
+   SECTION 2 — PIPELINE: Collection_Data
+   ========================================================================== */
+
+-- 2.1) Staging table in SM_DB (created if missing)
+USE SM_DB;
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.tables WHERE name = 'Collected_Aging_MTD_Staging')
+BEGIN
+    CREATE TABLE dbo.Collected_Aging_MTD_Staging (
+        ID              INT IDENTITY(1,1) PRIMARY KEY,
+        CUSTOMER_NAME   NVARCHAR(255)  NULL,
+        INV_NO          NVARCHAR(100)  NULL,
+        INV_DTD         NVARCHAR(50)   NULL,
+        PAYMENT_TERMS   NVARCHAR(100)  NULL,
+        DUE_DTD         NVARCHAR(50)   NULL,
+        PYMT_DTD        NVARCHAR(50)   NULL,
+        GAP_DAYS        NVARCHAR(50)   NULL,
+        PAY_DAYS        NVARCHAR(50)   NULL,
+        BKT_0_30        NVARCHAR(50)   NULL,
+        BKT_31_60       NVARCHAR(50)   NULL,
+        BKT_61_90       NVARCHAR(50)   NULL,
+        BKT_91_120      NVARCHAR(50)   NULL,
+        BKT_121_150     NVARCHAR(50)   NULL,
+        BKT_OVER_151    NVARCHAR(50)   NULL,
+        PAY_STATUS      NVARCHAR(100)  NULL,
+        VEND_CODE       NVARCHAR(50)   NULL,
+        BILL_AMT        NVARCHAR(50)   NULL,
+        PYMT_AMT        NVARCHAR(50)   NULL,
+        BR_CD           NVARCHAR(50)   NULL,
+        LoadDate        DATETIME       NOT NULL DEFAULT GETDATE()
+    );
+END
+GO
+
+-- 2.2) Stored procedure
+USE SM_DB_WH;
+GO
+
+IF OBJECT_ID('dbo.usp_Load_Collection_Data_Incremental') IS NOT NULL
+    DROP PROCEDURE dbo.usp_Load_Collection_Data_Incremental;
+GO
+
+CREATE PROCEDURE dbo.usp_Load_Collection_Data_Incremental
+AS
+BEGIN
+    SET NOCOUNT ON;
+    DECLARE @RowsAffected INT;
+
+    BEGIN TRY
+        BEGIN TRANSACTION;
+
+        MERGE dbo.Collection_Data AS Target
+        USING (
+            SELECT
+                CUSTOMER_NAME,
+                INV_NO,
+                SM_DB_WH.dbo.fn_SafeParseDateTime(INV_DTD)                     AS INV_DTD,
+                TRY_CONVERT(FLOAT, REPLACE(PAYMENT_TERMS, ',', ''))            AS PAYMENT_TERMS,
+                SM_DB_WH.dbo.fn_SafeParseDateTime(DUE_DTD)                     AS DUE_DTD,
+                SM_DB_WH.dbo.fn_SafeParseDateTime(PYMT_DTD)                    AS PYMT_DTD,
+                TRY_CONVERT(FLOAT, REPLACE(GAP_DAYS, ',', ''))                 AS GAP_DAYS,
+                TRY_CONVERT(FLOAT, REPLACE(PAY_DAYS, ',', ''))                 AS PAY_DAYS,
+                TRY_CONVERT(FLOAT, REPLACE(BKT_0_30, ',', ''))                 AS BKT_0_30,
+                TRY_CONVERT(FLOAT, REPLACE(BKT_31_60, ',', ''))                AS BKT_31_60,
+                TRY_CONVERT(FLOAT, REPLACE(BKT_61_90, ',', ''))                AS BKT_61_90,
+                TRY_CONVERT(FLOAT, REPLACE(BKT_91_120, ',', ''))               AS BKT_91_120,
+                TRY_CONVERT(FLOAT, REPLACE(BKT_121_150, ',', ''))              AS BKT_121_150,
+                TRY_CONVERT(FLOAT, REPLACE(BKT_OVER_151, ',', ''))             AS BKT_OVER_151,
+                PAY_STATUS,
+                TRY_CONVERT(FLOAT, VEND_CODE)                                   AS VEND_CODE,
+                TRY_CONVERT(FLOAT, REPLACE(BILL_AMT, ',', ''))                 AS BILL_AMT,
+                TRY_CONVERT(FLOAT, REPLACE(PYMT_AMT, ',', ''))                 AS PYMT_AMT,
+                TRY_CONVERT(FLOAT, BR_CD)                                       AS BR_CD
+            FROM SM_DB.dbo.Collected_Aging_MTD_Staging
+        ) AS Source
+        ON  Target.VEND_CODE = Source.VEND_CODE
+        AND Target.INV_NO    = Source.INV_NO
+
+        WHEN MATCHED THEN
+            UPDATE SET
+                CUSTOMER_NAME  = Source.CUSTOMER_NAME,  INV_DTD        = Source.INV_DTD,
+                PAYMENT_TERMS  = Source.PAYMENT_TERMS,  DUE_DTD        = Source.DUE_DTD,
+                PYMT_DTD       = Source.PYMT_DTD,       GAP_DAYS       = Source.GAP_DAYS,
+                PAY_DAYS       = Source.PAY_DAYS,       BKT_0_30       = Source.BKT_0_30,
+                BKT_31_60      = Source.BKT_31_60,      BKT_61_90      = Source.BKT_61_90,
+                BKT_91_120     = Source.BKT_91_120,     BKT_121_150    = Source.BKT_121_150,
+                BKT_OVER_151   = Source.BKT_OVER_151,   PAY_STATUS     = Source.PAY_STATUS,
+                BILL_AMT       = Source.BILL_AMT,       PYMT_AMT       = Source.PYMT_AMT,
+                BR_CD          = Source.BR_CD
+
+        WHEN NOT MATCHED BY TARGET THEN
+            INSERT (
+                CUSTOMER_NAME, INV_NO, INV_DTD, PAYMENT_TERMS, DUE_DTD, PYMT_DTD,
+                GAP_DAYS, PAY_DAYS, BKT_0_30, BKT_31_60, BKT_61_90, BKT_91_120,
+                BKT_121_150, BKT_OVER_151, PAY_STATUS, VEND_CODE, BILL_AMT, PYMT_AMT, BR_CD
+            )
+            VALUES (
+                Source.CUSTOMER_NAME, Source.INV_NO, Source.INV_DTD, Source.PAYMENT_TERMS,
+                Source.DUE_DTD, Source.PYMT_DTD, Source.GAP_DAYS, Source.PAY_DAYS,
+                Source.BKT_0_30, Source.BKT_31_60, Source.BKT_61_90, Source.BKT_91_120,
+                Source.BKT_121_150, Source.BKT_OVER_151, Source.PAY_STATUS, Source.VEND_CODE,
+                Source.BILL_AMT, Source.PYMT_AMT, Source.BR_CD
+            );
+
+        SET @RowsAffected = @@ROWCOUNT;
+
+        UPDATE dbo.ETL_Watermark
+        SET LastRunLog = CONCAT('OK - ', @RowsAffected, ' rows affected (full sync)'), LastRunTime = GETDATE()
+        WHERE TableName = 'Collection_Data';
+
+        COMMIT TRANSACTION;
+    END TRY
+    BEGIN CATCH
+        IF XACT_STATE() <> 0 ROLLBACK TRANSACTION;
+        UPDATE dbo.ETL_Watermark
+        SET LastRunLog = CONCAT('FAILED - ', ERROR_MESSAGE()), LastRunTime = GETDATE()
+        WHERE TableName = 'Collection_Data';
+        THROW;
+    END CATCH
+END
+GO
+
+
+/* ==========================================================================
+   SECTION 3 — PIPELINE: Dues_Actual_Collection (full delete + insert)
+   ========================================================================== */
+
+USE SM_DB_WH;
+GO
+
+IF OBJECT_ID('dbo.usp_Load_Dues_Actual_Collection') IS NOT NULL
+    DROP PROCEDURE dbo.usp_Load_Dues_Actual_Collection;
+GO
+
+CREATE PROCEDURE dbo.usp_Load_Dues_Actual_Collection
+AS
+BEGIN
+    SET NOCOUNT ON;
+    DECLARE @RowsAffected INT;
+
+    BEGIN TRY
+        BEGIN TRANSACTION;
+
+        DELETE FROM dbo.Dues_Actual_Collection;
+
+        INSERT INTO dbo.Dues_Actual_Collection (
+            COMPANY, CLIENT_CODE, CLIENT_NAME, SALES_PERSON, AREA, P_DAYS, CR_LIMIT,
+            BRANCHCD, TOTAL_AMOUNT, NOT_DUE, TOTAL_DUE, DUE_0_TO_30, DUE_31_TO_60,
+            DUE_61_TO_90, DUE_91_TO_120, DUE_121_TO_150, DUE_OVER_150
+        )
+        SELECT
+            COMPANY,
+            TRY_CONVERT(FLOAT, CLIENT_CODE),
+            CLIENT_NAME,
+            SALES_PERSON,
+            AREA,
+            TRY_CONVERT(FLOAT, P_DAYS),
+            TRY_CONVERT(FLOAT, REPLACE(CR_LIMIT, ',', '')),
+            TRY_CONVERT(FLOAT, BRANCHCD),
+            TRY_CONVERT(FLOAT, REPLACE(TOTAL_AMOUNT, ',', '')),
+            TRY_CONVERT(FLOAT, REPLACE(NOT_DUE, ',', '')),
+            TRY_CONVERT(FLOAT, REPLACE(TOTAL_DUE, ',', '')),
+            TRY_CONVERT(FLOAT, REPLACE(DUE_0_TO_30, ',', '')),
+            TRY_CONVERT(FLOAT, REPLACE(DUE_31_TO_60, ',', '')),
+            TRY_CONVERT(FLOAT, REPLACE(DUE_61_TO_90, ',', '')),
+            TRY_CONVERT(FLOAT, REPLACE(DUE_91_TO_120, ',', '')),
+            TRY_CONVERT(FLOAT, REPLACE(DUE_121_TO_150, ',', '')),
+            TRY_CONVERT(FLOAT, REPLACE(DUE_OVER_150, ',', ''))
+        FROM SM_DB.dbo.Debtor_Aging_Staging;
+
+        SET @RowsAffected = @@ROWCOUNT;
+
+        UPDATE dbo.ETL_Watermark
+        SET LastRunLog  = CONCAT('OK - ', @RowsAffected, ' rows reloaded'),
+            LastRunTime = GETDATE()
+        WHERE TableName = 'Dues_Actual_Collection';
+
+        COMMIT TRANSACTION;
+    END TRY
+    BEGIN CATCH
+        IF XACT_STATE() <> 0
+            ROLLBACK TRANSACTION;  -- table stays exactly as it was before this run
+
+        UPDATE dbo.ETL_Watermark
+        SET LastRunLog  = CONCAT('FAILED - ', ERROR_MESSAGE()),
+            LastRunTime = GETDATE()
+        WHERE TableName = 'Dues_Actual_Collection';
+
+        THROW;
+    END CATCH
+END
+GO
+
+
+/* ==========================================================================
+   SECTION 4 — SQL AGENT JOBS (one per pipeline, all every 30 min)
+   ========================================================================== */
+
+USE msdb;
+GO
+
+-- Job 1: Sales_Data
+IF EXISTS (SELECT 1 FROM msdb.dbo.sysjobs WHERE name = 'Load_Sales_Data_Incremental')
+    EXEC msdb.dbo.sp_delete_job @job_name = 'Load_Sales_Data_Incremental', @delete_unused_schedule = 1;
+GO
+EXEC msdb.dbo.sp_add_job
+    @job_name = 'Load_Sales_Data_Incremental', @enabled = 1,
+    @description = 'Incremental load of Sales_Invoices_Staging (SM_DB) into Sales_Data (SM_DB_WH)';
+EXEC msdb.dbo.sp_add_jobstep
+    @job_name = 'Load_Sales_Data_Incremental', @step_name = 'Run Incremental Load',
+    @subsystem = 'TSQL', @database_name = 'SM_DB_WH',
+    @command = 'EXEC dbo.usp_Load_Sales_Data_Incremental;', @retry_attempts = 2, @retry_interval = 2;
+EXEC msdb.dbo.sp_add_schedule
+    @schedule_name = 'SalesData_Every30Min', @freq_type = 4, @freq_interval = 1,
+    @freq_subday_type = 4, @freq_subday_interval = 30, @active_start_time = 000000;
+EXEC msdb.dbo.sp_attach_schedule
+    @job_name = 'Load_Sales_Data_Incremental', @schedule_name = 'SalesData_Every30Min';
+EXEC msdb.dbo.sp_add_jobserver
+    @job_name = 'Load_Sales_Data_Incremental', @server_name = @@SERVERNAME;
+GO
+
+-- Job 2: Collection_Data
+IF EXISTS (SELECT 1 FROM msdb.dbo.sysjobs WHERE name = 'Load_Collection_Data_Incremental')
+    EXEC msdb.dbo.sp_delete_job @job_name = 'Load_Collection_Data_Incremental', @delete_unused_schedule = 1;
+GO
+EXEC msdb.dbo.sp_add_job
+    @job_name = 'Load_Collection_Data_Incremental', @enabled = 1,
+    @description = 'Incremental load of Collected_Aging_MTD_Staging (SM_DB) into Collection_Data (SM_DB_WH)';
+EXEC msdb.dbo.sp_add_jobstep
+    @job_name = 'Load_Collection_Data_Incremental', @step_name = 'Run Incremental Load',
+    @subsystem = 'TSQL', @database_name = 'SM_DB_WH',
+    @command = 'EXEC dbo.usp_Load_Collection_Data_Incremental;', @retry_attempts = 2, @retry_interval = 2;
+EXEC msdb.dbo.sp_add_schedule
+    @schedule_name = 'CollectionData_Every30Min', @freq_type = 4, @freq_interval = 1,
+    @freq_subday_type = 4, @freq_subday_interval = 30, @active_start_time = 000000;
+EXEC msdb.dbo.sp_attach_schedule
+    @job_name = 'Load_Collection_Data_Incremental', @schedule_name = 'CollectionData_Every30Min';
+EXEC msdb.dbo.sp_add_jobserver
+    @job_name = 'Load_Collection_Data_Incremental', @server_name = @@SERVERNAME;
+GO
+
+-- Job 3: Dues_Actual_Collection
+IF EXISTS (SELECT 1 FROM msdb.dbo.sysjobs WHERE name = 'Load_Dues_Actual_Collection')
+    EXEC msdb.dbo.sp_delete_job @job_name = 'Load_Dues_Actual_Collection', @delete_unused_schedule = 1;
+GO
+EXEC msdb.dbo.sp_add_job
+    @job_name = 'Load_Dues_Actual_Collection', @enabled = 1,
+    @description = 'Full truncate/reload of Debtor_Aging_Staging (SM_DB) into Dues_Actual_Collection (SM_DB_WH)';
+EXEC msdb.dbo.sp_add_jobstep
+    @job_name = 'Load_Dues_Actual_Collection', @step_name = 'Run Reload',
+    @subsystem = 'TSQL', @database_name = 'SM_DB_WH',
+    @command = 'EXEC dbo.usp_Load_Dues_Actual_Collection;', @retry_attempts = 2, @retry_interval = 2;
+EXEC msdb.dbo.sp_add_schedule
+    @schedule_name = 'DuesCollection_Every30Min', @freq_type = 4, @freq_interval = 1,
+    @freq_subday_type = 4, @freq_subday_interval = 30, @active_start_time = 000000;
+EXEC msdb.dbo.sp_attach_schedule
+    @job_name = 'Load_Dues_Actual_Collection', @schedule_name = 'DuesCollection_Every30Min';
+EXEC msdb.dbo.sp_add_jobserver
+    @job_name = 'Load_Dues_Actual_Collection', @server_name = @@SERVERNAME;
+GO
+
+
+/* ==========================================================================
+   SECTION 5 — RUN ALL THREE NOW + VERIFY
+   ========================================================================== */
+
+EXEC msdb.dbo.sp_start_job @job_name = 'Load_Sales_Data_Incremental';
+EXEC msdb.dbo.sp_start_job @job_name = 'Load_Collection_Data_Incremental';
+EXEC msdb.dbo.sp_start_job @job_name = 'Load_Dues_Actual_Collection';
+GO
+
+-- Give the jobs a few seconds to finish, then check:
+-- SELECT * FROM SM_DB_WH.dbo.ETL_Watermark
+-- WHERE TableName IN ('Sales_Data','Collection_Data','Dues_Actual_Collection');
