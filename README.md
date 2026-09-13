@@ -1,1 +1,241 @@
-# ETL-Using-SSIS---SQL-server---Incremental-Refresh-
+ETL Using SSIS – SQL Server – Incremental Refresh
+📌 Overview
+
+This project demonstrates an ETL (Extract, Transform, Load) data integration solution built using SQL Server Integration Services (SSIS) and Microsoft SQL Server.
+
+The solution is designed to extract data from source systems, transform and validate it, and load it into a structured data warehouse. It uses an incremental refresh strategy to process only new or modified records, improving performance and reducing unnecessary data processing.
+
+🎯 Purpose
+
+The goal of this project is to:
+
+Build an automated ETL pipeline using SSIS
+Extract data from multiple source systems
+Clean, transform, and validate data before loading
+Load transformed data into SQL Server
+Implement incremental data loading instead of full refreshes
+Reduce ETL execution time and database workload
+Prepare reliable and structured data for reporting and analytics
+🛠️ Features
+Automated ETL workflows using SSIS
+Incremental data loading
+Full and incremental load mechanisms
+Data cleansing and transformation
+Source-to-target data validation
+Error handling and logging
+Control tables for tracking ETL execution
+Stored procedures for data processing
+Parameterized SSIS packages
+Scheduled ETL execution
+Scalable SQL Server data warehouse structure
+
+🧱 Technologies Used
+
+SQL Server – Database and data warehouse
+SSIS (SQL Server Integration Services) – ETL development and orchestration
+T-SQL – Data transformation and processing
+Stored Procedures – Business logic and incremental loading
+SQL Server Agent – Job scheduling and automation
+🔄 ETL Process
+
+The ETL pipeline follows these main stages:
+
+Extract
+
+Extract data from source databases/files.
+Load source data into staging tables.
+
+Transform
+
+Clean and standardize data.
+Handle NULL and duplicate values.
+Apply business rules.
+Validate data types and relationships.
+
+Load
+
+Load transformed data into the target database/data warehouse.
+Insert new records and update existing records when required.
+
+Incremental Refresh
+
+Identify new or changed records using a timestamp, ID, or other tracking mechanism.
+Process only the changed data.
+Update the control/watermark value after a successful load.
+
+⚡ Incremental Load Strategy
+
+Instead of reloading the entire dataset every time, the solution identifies records that have been added or modified since the previous ETL execution.
+
+For example:
+
+Last Successful Load
+        ↓
+Identify New/Updated Records
+        ↓
+Extract Incremental Data
+        ↓
+Transform & Validate
+        ↓
+Load into SQL Server
+        ↓
+Update Last Load Timestamp
+
+
+This approach helps improve ETL performance, especially when working with large datasets.
+
+📊 Data Warehouse & Reporting
+
+The processed data can be used to build:
+
+Sales performance reports
+Monthly and annual analysis
+Customer and product analytics
+KPI dashboards
+Operational reports
+Business intelligence solutions
+
+The ETL process ensures that reporting systems receive clean, consistent, and up-to-date data.
+
+⚙️ How It Works
+
+Source data is collected from the operational systems.
+SSIS extracts the required data.
+Data is stored temporarily in staging tables.
+Transformation and validation rules are applied.
+New and modified records are identified.
+Incremental data is loaded into the target SQL Server tables.
+ETL execution details are logged.
+SQL Server Agent can schedule the packages automatically.
+Reports and dashboards consume the updated data.
+
+📁 Project Structure
+Source → Original operational data
+Staging → Temporary tables used during ETL
+SSIS Packages → ETL workflows and transformations
+Stored Procedures → Data processing and incremental load logic
+Control Tables → ETL execution and watermark tracking
+Data Warehouse → Final transformed data
+SQL Scripts → Database objects and deployment scripts
+Documentation → ETL architecture and implementation details
+🚀 How to Use
+Install Microsoft SQL Server and SSIS.
+Create the required source and destination databases.
+Execute the provided SQL scripts.
+Configure SSIS connection managers.
+Set the required package parameters.
+Execute the initial full load.
+Run the incremental ETL package for subsequent loads.
+Verify the loaded data and ETL execution logs.
+Schedule the SSIS package using SQL Server Agent if required.
+
+📌 Future Improvements
+Integration with Power BI
+Cloud migration using Azure Data Factory
+Integration with Azure SQL Database
+Implementation of Slowly Changing Dimensions (SCD)
+Advanced ETL monitoring and alerting
+Improved error recovery and retry mechanisms
+Parallel data processing for large datasets
+Metadata-driven ETL framework
+Role-based security and access control
+
+👤 Author
+
+Mostafa Shehata
+Senior Business Intelligence Analyst / Database Developer
+
+
+
+## 📊 Dashboard & Reports Picture 
+
+
+
+## Home Page Navigator
+
+<img width="1871" height="792" alt="Screenshot 2026-04-22 111146" src="https://github.com/user-attachments/assets/19a73b51-90bb-4664-be53-1523c4ca72df" />
+
+
+
+
+
+
+
+
+## Overview Summary Report
+
+<img width="1856" height="786" alt="Screenshot 2026-04-22 112103" src="https://github.com/user-attachments/assets/df6d9981-2a57-4261-bc31-3835f767a720" />
+
+
+
+
+
+
+
+
+## Overview Dashboard Report
+
+<img width="1873" height="778" alt="Screenshot 2026-04-22 112123" src="https://github.com/user-attachments/assets/fcb00d01-4475-491a-887e-4a7743ff7085" />
+
+
+
+
+
+
+
+
+
+
+
+## Overview Achievement Report
+
+<img width="1867" height="783" alt="Screenshot 2026-04-22 112139" src="https://github.com/user-attachments/assets/55993e3c-5582-4c84-8b14-f5b66668d23f" />
+
+
+
+
+
+
+
+
+
+
+
+
+## Daily Sales Report
+
+<img width="1866" height="790" alt="Screenshot 2026-04-22 112156" src="https://github.com/user-attachments/assets/3a161ef5-4830-486a-a6e2-75d5b0a61eb2" />
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+## Stock Report
+
+<img width="1862" height="773" alt="Screenshot 2026-04-22 112210" src="https://github.com/user-attachments/assets/9cd11d6a-adb9-4f5c-9838-8a1d73b3bc9a" />
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+## Thanks For Review
