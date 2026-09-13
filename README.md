@@ -1,11 +1,12 @@
-ETL Using SSIS – SQL Server – Incremental Refresh
-📌 Overview
+## ETL Using SSIS – SQL Server – Incremental Refresh
+
+## 📌 Overview
 
 This project demonstrates an ETL (Extract, Transform, Load) data integration solution built using SQL Server Integration Services (SSIS) and Microsoft SQL Server.
 
 The solution is designed to extract data from source systems, transform and validate it, and load it into a structured data warehouse. It uses an incremental refresh strategy to process only new or modified records, improving performance and reducing unnecessary data processing.
 
-🎯 Purpose
+## 🎯 Purpose
 
 The goal of this project is to:
 
@@ -29,7 +30,7 @@ Parameterized SSIS packages
 Scheduled ETL execution
 Scalable SQL Server data warehouse structure
 
-🧱 Technologies Used
+## 🧱 Technologies Used
 
 SQL Server – Database and data warehouse
 SSIS (SQL Server Integration Services) – ETL development and orchestration
@@ -151,9 +152,10 @@ Senior Business Intelligence Analyst / Database Developer
 
 
 
-## Home Page Navigator
+## Home object Explorer SQL Server
 
-<img width="1871" height="792" alt="Screenshot 2026-04-22 111146" src="https://github.com/user-attachments/assets/19a73b51-90bb-4664-be53-1523c4ca72df" />
+<img width="392" height="1257" alt="image" src="https://github.com/user-attachments/assets/3dda9992-d8e5-4263-8e53-83fbd09150e1" />
+
 
 
 
